@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import json
 
@@ -24,14 +25,13 @@ Usage options:
 
 
 def train(log_dir, log_name, acting_config, env, model_config, training_config,
-          policy_args={}, env_args={}):
+          policy_args={}, env_args={}, restore_dir=None, discriminator_model_config={}):
     # Create the logger
     full_name = type_to_string(env)+"_" + \
         type_to_string(training_config["type"]) + \
         (f"_{log_name}" if log_name else "")
     logger = DirectoryLogger.create_new(
         base_path=log_dir, name=full_name)
-
     # Log the full config to the output directory
     logger.log_config({
         "acting": acting_config,
@@ -42,11 +42,12 @@ def train(log_dir, log_name, acting_config, env, model_config, training_config,
         "training": training_config
     })
 
+    # TODO(frederik): Move mode/difficulty selection from common.py here
     # Make the env-creation function
     env_creator = make_env_creator(env, **env_args)
-
     # Create the actors
     actors = create_actors_from_config(env_creator, acting_config)
+    
 
     # Create the specified training class with the specified arguments
     assert("type" in training_config), \
@@ -54,17 +55,24 @@ def train(log_dir, log_name, acting_config, env, model_config, training_config,
     training_cls = get_registered_type("trainers", training_config['type'])
     trainer = training_cls(
         logger=logger, actors=actors, model_config=model_config,
-        policy_args=policy_args)
+        policy_args=policy_args, discriminator_model_config=discriminator_model_config)
+    # TODO(frederik): Define curriculum options to change the actors during training (e.g. between flavours)?
+    if restore_dir:
+        logger = DirectoryLogger(restore_dir, use_logging=False, tensorboard=False)
+        training_step, cp_data = logger.get_checkpoint()
+        logging.getLogger().info(f"Loaded checkpoint from step: {training_step}")
+        trainer.init_policies()
+        actors.update_state(0, cp_data['policy_state'])
 
     # Train with the specified training arguments
-    trainer.train(**training_config.get("args", {}))
+    trainer.train(**training_config.get("args", {}), skip_init=True if restore_dir else False)
 
     # Cleanup Actors
     actors.close()
 
 
 def train_from_config(log_dir, log_name,
-                      config, env=None, num_envs=None, conf_update=None):
+                      config, env=None, num_envs=None, conf_update=None, restore_dir=None):
     """Trains the given configuration
 
     args:
@@ -105,10 +113,12 @@ def train_from_config(log_dir, log_name,
     if conf_update:
         config = dict(config)  # Avoid changing the passed config
         deep_dictionary_update(config, conf_update)
+    
+    discriminator_model_config = config.get("discriminator_model", None)
 
     train(
         log_dir, log_name, acting_config, env, model_config, train_config,
-        config.get("policy_args", {}), config.get("env_args", {}))
+        config.get("policy_args", {}), config.get("env_args", {}), restore_dir=restore_dir, discriminator_model_config=discriminator_model_config)
 
 
 def parse_args():
@@ -136,7 +146,9 @@ def parse_args():
     parser.add_argument(
         '--conf-update', type=str,
         help="Optional JSON dictionary string to deep-update the config with")
-
+    parser.add_argument(
+        '--restore-dir', type=str,
+        help="The path to the training directory result to restore")
     return parser.parse_args()
 
 
@@ -147,7 +159,7 @@ def main():
         else json.loads(args.conf_update)
     train_from_config(
         log_dir=args.log_dir, log_name=args.log_name, config=args.config,
-        env=args.env, num_envs=args.num_envs, conf_update=conf_update)
+        env=args.env, num_envs=args.num_envs, conf_update=conf_update, restore_dir=args.restore_dir)
 
 if __name__ == '__main__':
     main()

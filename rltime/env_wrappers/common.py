@@ -1,3 +1,4 @@
+import logging
 import gym
 import numpy as np
 import cv2
@@ -9,6 +10,7 @@ import pathlib
 from rltime.general.backend import get_channel_axis
 from gym.wrappers.monitoring.video_recorder import ImageEncoder
 from gym.wrappers.time_limit import TimeLimit
+from .switching_env_wrapper import SwitchingWrapper
 
 
 class EpisodeTracker(gym.Wrapper):
@@ -439,36 +441,53 @@ def make_env_creator(env_type, wrappers=[], imports=[],
     Returns: A function which creates a new instance of the ENV
     """
     def create():
+        nonlocal env_type
         for import_name in imports:
             importlib.import_module(import_name)
-        if isinstance(env_type, str):
-            assert(not kwargs), "ENV kwargs not supported for gym envs"
-            env = gym.make(env_type)
-        elif callable(env_type):
-            env = env_type(**kwargs)
+        if "envs" in kwargs and "mode" not in kwargs and "difficulty" not in kwargs:
+            env_configs = [(env_type, env["mode"], env["difficulty"]) for env in kwargs["envs"]]
         else:
-            raise ValueError(
-                "make_env_creator() expected either a string or "
-                f"callable for 'env_type', got {type(env_type)}")
-
-        # Limit the max steps per episode if requested
-        if max_episode_steps is not None:
-            if hasattr(env, "_max_episode_steps"):
-                # Use the '_max_episode_steps' if available from gym. This is
-                # to allow increasing the limit for example in cartpole.
-                # (The TimeLimit option can only decrease the limit)
-                env._max_episode_steps = max_episode_steps
+            mode = kwargs["mode"] if "mode" in kwargs else 0
+            difficulty = kwargs["difficulty"] if "difficulty" in kwargs else 0
+            env_configs = [(env_type, mode, difficulty)]
+        envs = []
+        for env_type, mode, difficulty in env_configs:
+            if isinstance(env_type, str):
+                # assert(not kwargs), "ENV kwargs not supported for gym envs"
+                env = gym.make(env_type, mode=mode, difficulty=difficulty)
+            elif callable(env_type):
+                env = env_type(**kwargs)
             else:
-                env = TimeLimit(env, max_episode_steps)
+                raise ValueError(
+                    "make_env_creator() expected either a string or "
+                    f"callable for 'env_type', got {type(env_type)}")
 
-        # Always begin with EpisodeTracker so that the training gets the real
-        # rewards/dones before any additional wrappers process them
-        env = EpisodeTracker(env)
+            # Limit the max steps per episode if requested
+            if max_episode_steps is not None:
+                if hasattr(env, "_max_episode_steps"):
+                    # Use the '_max_episode_steps' if available from gym. This is
+                    # to allow increasing the limit for example in cartpole.
+                    # (The TimeLimit option can only decrease the limit)
+                    env._max_episode_steps = max_episode_steps
+                else:
+                    env = TimeLimit(env, max_episode_steps)
 
-        # Apply all requested wrappers
-        for wrapper in wrappers:
-            wrapper_type = wrapper.get("type")
-            wrapper_args = wrapper.get("args", {})
-            env = wrapper_type(env, **wrapper_args)
+            # Always begin with EpisodeTracker so that the training gets the real
+            # rewards/dones before any additional wrappers process them
+            env = EpisodeTracker(env)
+
+            # Apply all requested wrappers
+            for wrapper in wrappers:
+                wrapper_type = wrapper.get("type")
+                wrapper_args = wrapper.get("args", {})
+                env = wrapper_type(env, **wrapper_args)
+            envs.append(env)
+        if len(envs) == 1:
+            env = envs[0]
+        else:
+            envs = [SwitchingWrapper(env, i) for i, env in enumerate(envs)]
+            index = np.random.choice(len(envs), p=kwargs["probs"])
+            env = envs[index]
+        logging.getLogger().debug("Mode: ", env.unwrapped.game_mode, "Difficulty: ", env.unwrapped.game_difficulty)
         return env
     return create

@@ -19,6 +19,7 @@ _template = {
         "type": object,
         "args": dict
     },
+    "discriminator_model": object,
     "policy_args": dict,
     "training": {
         "type": object,

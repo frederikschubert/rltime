@@ -1,12 +1,14 @@
 """ Entry point for evaluating/rendering a trained policy. """
 
 import argparse
+import json
 import os
 import numpy as np
 import time
 import datetime
 
 from rltime.general.config import load_config
+from rltime.general.utils import deep_dictionary_update
 from rltime.general.type_registry import get_registered_type
 from rltime.env_wrappers.common import make_env_creator, EpisodeRecorder
 from rltime.env_wrappers.vec_env.sub_proc import make_sub_proc_vec_env
@@ -35,7 +37,7 @@ def create_policy_from_config(config, action_space, observation_space):
 
 
 def eval_policy(path, num_envs, episode_count, record=False, record_fps=60,
-                render=False, render_fps=None, eps=0.001):
+                render=False, render_fps=None, eps=0.001, conf_update=None):
     """Evaluates training result at 'path', loading the last checkpoint
 
     The result is logged to a new line in file 'eval.json' in <path>
@@ -78,6 +80,10 @@ def eval_policy(path, num_envs, episode_count, record=False, record_fps=60,
 
     # Load the config from the result path
     config = logger.get_config()
+    
+    if conf_update:
+        config = dict(config)  # Avoid changing the passed config
+        deep_dictionary_update(config, conf_update)
 
     # Make the env-creaton function based on the config settings
     env_args = config.get("env_args", {})
@@ -115,7 +121,7 @@ def eval_policy(path, num_envs, episode_count, record=False, record_fps=60,
     lengths = []
     # This signifies the ENV started the episode in time and should be counted
     masks = [True] * num_envs
-
+    # TODO(frederik): Mention mode and difficulty
     print(f"Running '{config.get('env')}' for {episode_count} episodes"
           f" on {num_envs} ENVs")
     while len(rewards) < episode_count:
@@ -212,16 +218,21 @@ def parse_args():
         '--eps', type=float, default=0.001,
         help="Epsilon value to use for random action selection during "
              "evaluation")
+    parser.add_argument(
+        '--conf-update', type=str,
+        help="Optional JSON dictionary string to deep-update the config with")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    conf_update = None if not args.conf_update \
+        else json.loads(args.conf_update)
 
     eval_policy(
         args.path, num_envs=args.num_envs, episode_count=args.episodes,
         record=args.record, record_fps=args.record_fps,
-        render=args.render, render_fps=args.render_fps, eps=args.eps)
+        render=args.render, render_fps=args.render_fps, eps=args.eps, conf_update=conf_update)
 
 if __name__ == '__main__':
     main()

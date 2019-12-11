@@ -1,10 +1,20 @@
 from rltime.training.multi_step_trainer import MultiStepTrainer
 import torch
+import numpy as np
 from rltime.models.torch.utils import set_lr
-
+from rltime.discriminators.torch.simple import Simple
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import json
+import time
+import os
 
 class TorchTrainer(MultiStepTrainer):
     """ Base class for all multi-step pytorch training. """
+
+    @staticmethod
+    def create_discriminator(observation_space, model_config):
+        return Simple(observation_space, model_config)
 
     def _train(self, clip_grad=None, clip_grad_dynamic_alpha=None,
                adam_epsilon=1e-8, vf_scale_epsilon=None, **kwargs):
@@ -40,6 +50,7 @@ class TorchTrainer(MultiStepTrainer):
         assert((not vf_scale_epsilon) or (not self.clip_rewards)), \
             "Value function rescaling only makes sense with clip_rewards=False"
         self.vf_scale_epsilon = vf_scale_epsilon
+        self.last_debug_ts = 0
 
         super()._train(**kwargs)
 
@@ -81,6 +92,9 @@ class TorchTrainer(MultiStepTrainer):
         """Init the training with given LR (Called after policy creation)"""
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(), eps=self.adam_epsilon)
+        if self.discriminator_model_config:
+            # TODO(frederik): Use different learning rate and epsilon for ADAM
+            self.discriminator_optimizer = torch.optim.Adam(self.discriminator.parameters(), eps=self.adam_epsilon)
 
     def _compute_grads(self, states, targets, policy_outputs, extra_data,
                        timesteps):
@@ -197,3 +211,95 @@ class TorchTrainer(MultiStepTrainer):
 
         # Perform the optimizer weight update
         self.optimizer.step()
+
+    def train_batch_discriminator(self, states, predictions, env_indices, timesteps):
+        # Reset gradients
+        self.discriminator.zero_grad()
+
+        # Compute the gradients on the given training arugments
+        self._compute_discriminator_grads(states, predictions, env_indices, timesteps)
+
+        # Log and optionally clip the global gradient norm before updating the
+        # weights
+        grad_norm = self.discriminator.get_grad_norm()
+        self.value_log.log("grad_norm", grad_norm, group="train_discriminator")
+        self.value_log.log(
+            "grad_norm_max", grad_norm, group="train_discriminator", agg="max")
+        # TODO(frederik): Use own clip value
+        clip_value = self._get_grad_norm_clip_value(grad_norm)
+        if clip_value is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self.discriminator.parameters(), clip_value)
+            self.value_log.log(
+                "grad_norm_clipped", self.policy.get_grad_norm(),
+                group="train_discriminator")
+        # Perform the optimizer weight update
+        self.discriminator_optimizer.step()
+
+    def _prepare_states(self, states, timesteps):
+        # TODO(frederik): Reorder states for lstm layer dynamically (this depends on the model that was used)
+        states = dict(states)
+        states["layer2_state"] = states["layer1_state"]
+        states["layer1_state"] = states["layer0_state"]
+        obs = states["x"][0].clone()
+        batch_size = obs.shape[0] // timesteps
+        for layer_state in states.values():
+            if type(layer_state) == dict:
+                for field in ["cx", "hx"]:
+                    if field in layer_state:
+                        layer_state[field] = torch.zeros_like(layer_state[field])
+                if "initials" in layer_state:
+                    layer_state["initials"] = torch.zeros_like(layer_state["initials"])
+                    layer_state["initials"] = layer_state["initials"].view((timesteps, batch_size)+layer_state["initials"].shape[1:])
+                    layer_state["initials"][0] = 1.0
+                    layer_state["initials"] = layer_state["initials"].reshape((layer_state["initials"].shape[0]*layer_state["initials"].shape[1],)+layer_state["initials"].shape[2:])
+        obs = obs.view((timesteps, batch_size)+obs.shape[1:])
+        masked_frames = 5
+        masked_indices = torch.fmod(torch.arange(timesteps), masked_frames) != 0
+        obs[masked_indices] = 0.0
+        obs = obs.reshape((obs.shape[0]*obs.shape[1],)+obs.shape[2:])
+        states["x"] = (obs, states["x"][1])
+        return states
+
+    def _compute_discriminator_grads(self, states, predictions, env_indices, timesteps):
+        loss_fn = torch.nn.BCELoss(reduction="none")
+        batch_size = env_indices.shape[0] // timesteps
+        env_indices = env_indices.reshape((timesteps, batch_size)+env_indices.shape[1:])
+        predictions = predictions.view((timesteps, batch_size)+predictions.shape[1:])
+        loss = loss_fn(predictions[-1], self.discriminator.make_tensor(env_indices == 0)[-1])
+        # mask = torch.fmod(torch.arange(states["x"][0].shape[0]), 2) == 0
+        # loss *= mask
+        loss = loss.mean()
+        loss.backward()
+
+        self.value_log.log("loss", loss.item(), group="train_discriminator")
+    
+    @staticmethod
+    def write_trajectory(obs, env_indices, predictions, timesteps, path):
+        trajectory_path = os.path.join(path, f"trajectories_{time.time()}")
+        os.makedirs(trajectory_path)
+        batch_size = obs.shape[0] // timesteps
+        obs = obs.view((timesteps, batch_size)+obs.shape[1:])
+
+        for i in range(batch_size):
+            fig = plt.figure()
+            artists = [[plt.imshow(obs[j, i].squeeze().cpu(), cmap='gray', animated=True)] for j in range(timesteps)]
+            pred_mean = round(predictions[i*timesteps+timesteps].detach().cpu().numpy(), 2)
+            env_index = env_indices[i*timesteps]
+            plt.axis('off')
+            ani = animation.ArtistAnimation(fig, artists, interval=600, blit=True)
+            ani.save(os.path.join(trajectory_path, f"{env_index}_{i}_{pred_mean}.mp4"), extra_args=["-loglevel", "panic"])
+
+    def _process_train_data(self, train_data, timesteps):
+        states = self._prepare_states(train_data["states"], timesteps)
+        predictions = self.discriminator.predict(states, timesteps).squeeze()
+        #mean_returns = train_data["returns"].mean() # TODO(frederik): Scale rewards with running average of the rewards ONLY from env 0?
+        train_data_entries = train_data["env_indices"] != 0
+
+        if time.time() - self.last_debug_ts > 600:
+            self.last_debug_ts = time.time()
+            TorchTrainer.write_trajectory(obs=states["x"][0], env_indices=train_data["env_indices"], predictions=predictions, timesteps=timesteps, path=self.logger.path)
+        returns = predictions.detach()[train_data_entries]
+        train_data["returns"][train_data_entries] = returns
+        self.value_log.log("discriminator_returns", returns, group="train_discriminator")
+        return train_data, predictions

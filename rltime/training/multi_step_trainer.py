@@ -1,11 +1,14 @@
-
+import logging
 import numpy as np
 import math
+import pickle
+from gym import spaces
 
 from .policy_trainer import PolicyTrainer
 from rltime.general.type_registry import get_registered_type
 from rltime.history.parallel_history import ParallelHistoryWrapper
 from rltime.general.utils import deep_apply
+from rltime.discriminators.disciminator import Discriminator
 
 
 class MultiStepTrainer(PolicyTrainer):
@@ -39,9 +42,64 @@ class MultiStepTrainer(PolicyTrainer):
         """Sets/changes the learning rate during training"""
         raise NotImplementedError
 
-    def train_batch(self, states, targets, policy_outputs, extra_data,
-                    timesteps):
+    def train_batch(self, states, timesteps):
         """Trains the given states with the calculated target values"""
+        raise NotImplementedError
+
+    @staticmethod
+    def create_discriminator(observation_space, model_config) -> Discriminator:
+        raise NotImplementedError
+
+    def init_policies(self):
+        super().init_policies()
+        if self.discriminator_model_config:
+            observation_space, _ = self.actors.get_spaces()
+            logging.getLogger().info(f"Creating Discriminator")
+            self.discriminator = self.create_discriminator(observation_space, self.discriminator_model_config)
+            logging.getLogger().info(f"Discriminator:\n{self.discriminator}")
+            discriminator_size = len(pickle.dumps(self.discriminator.get_state()))/1024./1024.
+            logging.getLogger().info("Discriminator Size: %.2fMB" % discriminator_size)
+
+    def train_discriminator(self, train_data, predictions, nstep_train, rnn_steps_train, epochs, minibatches):
+        """Trains the discriminator on the given trajectories"""
+        # Perform mini-batch updates if requested
+        batch_size = train_data['returns'].shape[0]
+        assert((batch_size % minibatches) == 0)
+        mini_batch_size = batch_size // minibatches
+
+        for _ in range(epochs):
+            # Shuffle the train indices (Only meaningful in case of
+            # minibatches>1)
+            inds = self.get_train_indexes(
+                batch_size, mini_batch_size, nstep_train)
+
+            for i in range(0, batch_size, mini_batch_size):
+                if minibatches > 1:
+                    tinds = inds[i:i+mini_batch_size]
+                    slicer = lambda y: deep_apply(y, lambda x: x[tinds])
+                else:
+                    # Avoid re-indexing if it has no meaning (If there is
+                    # no mini-batching then shuffling makes no difference
+                    # to training)
+                    slicer = lambda x: x
+
+                # Train on the batch, in case of an LSTM in the model the
+                # rnn_steps_train value will be used by the LSTM module to
+                # reshape the batch to timesteps of that length for the
+                # LSTM sequencing
+                self.train_batch_discriminator(slicer(train_data['states']), predictions, slicer(train_data['env_indices']), rnn_steps_train)
+
+                # Log the actual/total batch-size used for training
+                self.value_log.log(
+                    "batch_size", mini_batch_size, group="train_discriminator")
+        # TODO(frederik): Use learning rate schedule?
+    
+    def train_batch_discriminator(self, states, predictions, env_indices, timesteps):
+        """Trains the discriminator on the given trajectory batch"""
+        raise NotImplementedError
+
+    def _compute_discriminator_grads(self, states, predictions, env_indices, timesteps):
+        """Compute the gradients of the discriminator"""
         raise NotImplementedError
 
     def get_train_indexes(self, batch_size, mini_batch_size, nstep):
@@ -149,11 +207,15 @@ class MultiStepTrainer(PolicyTrainer):
             # Local history buffer
             self.history_buffer = history_cls(**history_args)
 
+    def _process_train_data(self, train_data, rnn_steps_train):
+        """Set returns for test environment according to the discriminator's output"""
+        raise NotImplementedError
+
     def _train(self, gamma, nstep_train, lr, history_mode, mbatch_size=None,
                nstep_target=None, lr_anneal=False, epochs=1, minibatches=1,
                warmup_steps=0, actor_update_frequency_steps=1000,
                burn_in_timesteps=0, rnn_steps_train=None, rnn_bootstrap=False,
-               async_history=False):
+               async_history=False, discriminator_training=None):
         """ Entry point for multi-step training
 
         Args:
@@ -291,6 +353,9 @@ class MultiStepTrainer(PolicyTrainer):
                 train_data,
                 lambda x: x.reshape((x.shape[0]*x.shape[1],)+x.shape[2:]))
 
+            if self.discriminator_model_config and discriminator_training:
+                train_data, predictions = self._process_train_data(train_data, rnn_steps_train)
+
             if rnn_bootstrap:
                 assert(np.all(train_data['nsteps'] == nstep_target)), \
                     "rnn_bootstrap is only supported with history buffers " \
@@ -373,6 +438,11 @@ class MultiStepTrainer(PolicyTrainer):
                 actors_last_update_steps = self.steps
 
             self._end_timer()
+            # TODO(frederik): Introduce flavour ratio hyperparameter
+            if self.discriminator_model_config and discriminator_training:
+                self._start_timer("train_discriminator")
+                self.train_discriminator(train_data, predictions, nstep_train, **discriminator_training)
+                self._end_timer()
 
         # Close the parallel history buffer if configured
         if async_history:

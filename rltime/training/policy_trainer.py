@@ -5,6 +5,8 @@ import pickle
 
 from rltime.general.value_log import ValueLog
 from rltime.general.utils import deep_dictionary_update
+from rltime.discriminators.disciminator import Discriminator
+from rltime.policies.policy import Policy
 
 
 class PolicyTrainer():
@@ -20,17 +22,21 @@ class PolicyTrainer():
     Actual training class should override _train() which will get all training
     kwargs not relevant to this class
     """
-    def __init__(self, logger, actors, model_config, policy_args={}):
+    def __init__(self, logger, actors, model_config, policy_args={}, discriminator_model_config={}):
         self.logger = logger
         self.actors = actors
         self.model_config = model_config
         self.policy_args = policy_args
+        self.discriminator_model_config = discriminator_model_config
         self.episode_rewards = {}
         self.episode_lens = {}
         self.action_hist = {}
         self.action_hist_count = 0
         self.target_update_freq = 0
         self.value_log = ValueLog()
+        self.policy: Policy = None
+        self.target_policy: Policy = None
+        self.discriminator: Discriminator = None
 
     @staticmethod
     def create_policy(**kwargs):
@@ -125,12 +131,17 @@ class PolicyTrainer():
                         ("reward", self.episode_rewards[env_id]),
                         ("episode_length", self.episode_lens[env_id])]:
                     for last in self.episode_history_windows:
+                        if "env_index" in info:
+                            group_prefix = str(info["env_index"]) + "_"
+                        else:
+                            group_prefix = ""
+                        group = f"{group_prefix}last{last}"
                         self.value_log.log(
-                            key, value, scope=last, group=f"last{last}",
+                            key, value, scope=last, group=group,
                             precision=2)
                         self.value_log.log(
                             key+"_max", value, agg="max", scope=last,
-                            group=f"last{last}", precision=2)
+                            group=group, precision=2)
 
                 self.episode_rewards[env_id] = 0
                 self.episode_lens[env_id] = 0
@@ -283,7 +294,7 @@ class PolicyTrainer():
 
     def train(self, total_steps, log_freq=10000, target_update_freq=0,
               clip_rewards=False, early_stop_steps=None,
-              episode_history_windows=[10, 100], **kwargs):
+              episode_history_windows=[10, 100], skip_init=False, **kwargs):
         """ Trains the policy
 
         Args:
@@ -315,8 +326,9 @@ class PolicyTrainer():
 
         # Initialize the policies and update the actors with the latest policy
         # state
-        self.init_policies()
-        self.update_actors()
+        if not skip_init:
+            self.init_policies()
+            self.update_actors()
 
         logging.getLogger().info(
             "Training start with total acting ENVs: "
