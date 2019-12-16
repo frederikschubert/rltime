@@ -1,0 +1,9 @@
+[
+    {        
+        "type" : "@python('rltime.env_wrappers.atari.wrap_atari')",
+        "args" : {
+            "_comment" : "Don't frame stack when using LSTM. This reduces replay buffer overhead/size and GPU transfer times",
+            "stack" : 1
+        }
+    }
+]

@@ -60,7 +60,7 @@ class MultiStepTrainer(PolicyTrainer):
             discriminator_size = len(pickle.dumps(self.discriminator.get_state()))/1024./1024.
             logging.getLogger().info("Discriminator Size: %.2fMB" % discriminator_size)
 
-    def train_discriminator(self, train_data, predictions, nstep_train, rnn_steps_train, epochs, minibatches):
+    def train_discriminator(self, train_data, predictions, nstep_train, skipped_frames, rnn_steps_train, epochs, minibatches):
         """Trains the discriminator on the given trajectories"""
         # Perform mini-batch updates if requested
         batch_size = train_data['returns'].shape[0]
@@ -87,18 +87,16 @@ class MultiStepTrainer(PolicyTrainer):
                 # rnn_steps_train value will be used by the LSTM module to
                 # reshape the batch to timesteps of that length for the
                 # LSTM sequencing
-                self.train_batch_discriminator(slicer(train_data['states']), predictions, slicer(train_data['env_indices']), rnn_steps_train)
+                self.train_batch_discriminator(slicer(train_data['states']), predictions, slicer(train_data['env_indices']), skipped_frames, rnn_steps_train)
 
                 # Log the actual/total batch-size used for training
-                self.value_log.log(
-                    "batch_size", mini_batch_size, group="train_discriminator")
-        # TODO(frederik): Use learning rate schedule?
+                self.value_log.log("batch_size", mini_batch_size, group="train_discriminator")
     
-    def train_batch_discriminator(self, states, predictions, env_indices, timesteps):
+    def train_batch_discriminator(self, states, predictions, env_indices, skipped_frames, timesteps):
         """Trains the discriminator on the given trajectory batch"""
         raise NotImplementedError
 
-    def _compute_discriminator_grads(self, states, predictions, env_indices, timesteps):
+    def _compute_discriminator_grads(self, states, predictions, env_indices, skipped_frames, timesteps):
         """Compute the gradients of the discriminator"""
         raise NotImplementedError
 
@@ -207,7 +205,7 @@ class MultiStepTrainer(PolicyTrainer):
             # Local history buffer
             self.history_buffer = history_cls(**history_args)
 
-    def _process_train_data(self, train_data, rnn_steps_train):
+    def _process_train_data(self, train_data, skipped_frames, rnn_steps_train):
         """Set returns for test environment according to the discriminator's output"""
         raise NotImplementedError
 
@@ -328,6 +326,7 @@ class MultiStepTrainer(PolicyTrainer):
             self._start_timer("get_train_data")
             train_data = self.history_buffer.get_train_data(
                 mbatch_size, train_progress=train_progress)
+            
             if train_data is None:
                 # This means it still needs more samples
                 continue
@@ -354,7 +353,8 @@ class MultiStepTrainer(PolicyTrainer):
                 lambda x: x.reshape((x.shape[0]*x.shape[1],)+x.shape[2:]))
 
             if self.discriminator_model_config and discriminator_training:
-                train_data, predictions = self._process_train_data(train_data, rnn_steps_train)
+                skipped_frames = np.random.choice(discriminator_training["skipped_frames"])
+                train_data, predictions = self._process_train_data(train_data, skipped_frames, rnn_steps_train)
 
             if rnn_bootstrap:
                 assert(np.all(train_data['nsteps'] == nstep_target)), \
@@ -438,10 +438,9 @@ class MultiStepTrainer(PolicyTrainer):
                 actors_last_update_steps = self.steps
 
             self._end_timer()
-            # TODO(frederik): Introduce flavour ratio hyperparameter
             if self.discriminator_model_config and discriminator_training:
                 self._start_timer("train_discriminator")
-                self.train_discriminator(train_data, predictions, nstep_train, **discriminator_training)
+                self.train_discriminator(train_data, predictions, nstep_train, skipped_frames, **discriminator_training["args"])
                 self._end_timer()
 
         # Close the parallel history buffer if configured
